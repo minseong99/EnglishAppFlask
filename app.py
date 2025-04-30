@@ -50,7 +50,7 @@ async def synthesize(request: TTSRequest):
         return JSONResponse(content={"audio": audio_base64})
 
     except Exception as e:
-        logging.error(f"TTS 합성 오류: {e}")
+        logging.error("TTS 합성 전체 오류:\n" + traceback.format_exc())
         raise HTTPException(status_code=500, detail="TTS 처리 중 오류 발생")
 
 # 🚀 FastAPI 서버 실행
