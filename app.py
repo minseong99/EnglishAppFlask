@@ -1,58 +1,93 @@
-#app.py
+# app.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
-import base64
-import io
+import base64, io, os, logging, traceback
 import numpy as np
-import torch
-import wave
+import torch, wave
 from TTS.api import TTS
 import uvicorn
-import logging
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 # 🚀 GPU 활성화 (가능한 경우)
-use_gpu = torch.cuda.is_available()
-tts_model = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=use_gpu)
-sample_rate = 22050
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-logging.info(f"TTS 모델 로드 성공 (GPU 사용: {use_gpu})")
+# 1) 모델 로딩 & 최적화
+logging.info("Loading TTS model...")
+tts_model = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=DEVICE.type=="cuda")
+tts_model.model = tts_model.model.half()                       # FP16
+tts_model.model = torch.jit.script(tts_model.model)            # JIT compile
+tts_model.model.to(DEVICE)
+logging.info(f"TTS model ready on {DEVICE}")
 
-# 요청 데이터 구조 정의
+SAMPLE_RATE = 22050
+
+
+# 요청 데이터 구조
 class TTSRequest(BaseModel):
     text: str
-    speaker: str = None  # 선택적 화자
+    speaker: str = None
+
+
+# 간단 문장 분할 (마침표 기준)
+def split_sentences(text: str):
+    # 마침표/물음표/느낌표 뒤에 공백으로 분할
+    import re
+    parts = re.split(r'([.?!])\s*', text)
+    # ["Hello", ".", "How are you", "?"] → ["Hello.", "How are you?"]
+    sentences = []
+    for i in range(0, len(parts)-1, 2):
+        sentences.append((parts[i] + parts[i+1]).strip())
+    if len(parts) % 2 == 1 and parts[-1].strip():
+        sentences.append(parts[-1].strip())
+    return sentences or [text]
+
 
 @app.post("/api/tts")
-async def synthesize(request: TTSRequest):
-    try:
-        # TTS 변환 실행
-        wav = tts_model.tts(request.text, speaker=request.speaker) if request.speaker else tts_model.tts(request.text)
-        
-        # float [-1,1] -> int16 변환
-        wav = np.array(wav)
-        wav_int16 = (np.clip(wav, -1, 1) * 32767).astype(np.int16)
+async def synthesize(req: TTSRequest):
+    if not req.text.strip():
+        raise HTTPException(400, "No text provided")
 
-        # WAV 파일 메모리 저장
+    try:
+        # 2) 문장 단위 청킹
+        chunks = split_sentences(req.text)
+
+        # 메모리 버퍼에 결과 이어 쓰기
         buffer = io.BytesIO()
         with wave.open(buffer, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(wav_int16.tobytes())
+            wf.setframerate(SAMPLE_RATE)
 
+            for chunk in chunks:
+                # 3) no_grad로 추론
+                with torch.no_grad():
+                    wav = tts_model.tts(chunk, speaker=req.speaker) \
+                          if req.speaker else tts_model.tts(chunk)
+
+                # 합성 결과 합치기
+                arr = np.array(wav)
+                int16 = (np.clip(arr, -1, 1) * 32767).astype(np.int16)
+                wf.writeframes(int16.tobytes())
+
+        # 4) 최종 바이트 → base64
         audio_bytes = buffer.getvalue()
         audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+        return JSONResponse({"audio": audio_base64})
 
-        return JSONResponse(content={"audio": audio_base64})
+    except Exception:
+        logging.error("TTS processing error:\n" + traceback.format_exc())
+        raise HTTPException(500, "TTS 처리 중 오류 발생")
 
-    except Exception as e:
-        logging.error("TTS 합성 전체 오류:\n" + traceback.format_exc())
-        raise HTTPException(status_code=500, detail="TTS 처리 중 오류 발생")
 
-# 🚀 FastAPI 서버 실행
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000, workers=4)  # 멀티프로세싱 적용
+    # 로컬 디버그용: workers=1 로 메모리 절약
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 5000)),
+        workers=1,
+        log_level="info",
+    )
